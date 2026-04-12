@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Pro Horizon Lock - Final</title>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        #canvas-container { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+        canvas { width: 100%; height: 100%; object-fit: contain; }
+        .controls { position: absolute; bottom: 30px; width: 100%; display: flex; justify-content: center; gap: 10px; z-index: 20; }
+        button { background: rgba(255,255,255,0.15); border: 2px solid #fff; color: #fff; padding: 12px 20px; border-radius: 50px; font-weight: bold; backdrop-filter: blur(5px); }
+        #recordBtn.recording { background: #ff4444; border-color: #ff4444; animation: pulse 1s infinite; }
+        #downloadBtn { display: none; background: #2196F3; border-color: #2196F3; }
+        #telemetry { position: absolute; top: 15px; left: 15px; font-family: monospace; font-size: 10px; pointer-events: none; text-shadow: 1px 1px 2px #000; z-index: 30; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+        video { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="telemetry">INITIALIZING...</div>
+
+    <div id="canvas-container">
+        <canvas id="outputCanvas"></canvas>
+    </div>
+
+    <video id="rawVideo" autoplay playsinline muted></video>
+
+    <div class="controls">
+        <button id="startBtn">START SYSTEM</button>
+        <button id="recordBtn" style="display:none">REC</button>
+        <button id="stopBtn" style="display:none">STOP</button>
+        <a id="downloadLink"><button id="downloadBtn">SAVE TO GALLERY</button></a>
+    </div>
+
+    <script>
+        const video = document.getElementById('rawVideo');
+        const canvas = document.getElementById('outputCanvas');
+        const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+        
+        const telemetry = document.getElementById('telemetry');
+        const startBtn = document.getElementById('startBtn');
+        const recordBtn = document.getElementById('recordBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const downloadLink = document.getElementById('downloadLink');
+
+        let targetRoll = 0, currentRoll = 0;
+        let targetX = 0, currentX = 0;
+        let targetY = 0, currentY = 0;
+        
+        let mediaRecorder;
+        let chunks = [];
+        let isActive = false;
+        let startTime;
+
+        // --- 1. SENSOR LOGIC ---
+        function handleMotion(event) {
+            const acc = event.accelerationIncludingGravity;
+            if (!acc) return;
+            targetRoll = -Math.atan2(acc.x, acc.y) * (180 / Math.PI);
+            targetX = acc.x * 12; // Adjusted sensitivity
+            targetY = (acc.y - 9.8) * 12;
+        }
+
+        // --- 2. RENDER ENGINE ---
+        function render() {
+            if (!isActive) return;
+
+            let rollDiff = targetRoll - currentRoll;
+            if (rollDiff > 180) rollDiff -= 360;
+            if (rollDiff < -180) rollDiff += 360;
+            currentRoll += rollDiff * (Math.abs(rollDiff) > 2 ? 0.75 : 0.15);
+
+            currentX += (targetX - currentX) * 0.1;
+            currentY += (targetY - currentY) * 0.1;
+
+            const w = canvas.width;
+            const h = canvas.height;
+            const baseZoom = Math.sqrt(w*w + h*h) / Math.min(w, h);
+            const finalZoom = baseZoom * 1.15; 
+
+            ctx.save();
+            ctx.translate(w / 2, h / 2);
+            ctx.rotate(currentRoll * Math.PI / 180);
+            ctx.translate(-currentX, -currentY);
+            ctx.scale(finalZoom, finalZoom);
+            ctx.drawImage(video, -w / 2, -h / 2, w, h);
+            ctx.restore();
+
+            telemetry.innerText = `STABLE LOCK | TILT: ${currentRoll.toFixed(1)}°`;
+
+            if (video.requestVideoFrameCallback) {
+                video.requestVideoFrameCallback(render);
+            } else {
+                requestAnimationFrame(render);
+            }
+        }
+
+        // --- 3. SYSTEM LAUNCH ---
+        startBtn.onclick = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "environment", width: { ideal: 1280 } },
+                    audio: true
+                });
+                video.srcObject = stream;
+                
+                if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    await DeviceOrientationEvent.requestPermission();
+                }
+                window.addEventListener('devicemotion', handleMotion);
+
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    isActive = true;
+                    video.play();
+                    render();
+                    startBtn.style.display = 'none';
+                    recordBtn.style.display = 'block';
+                };
+            } catch (e) {
+                alert("Permission error.");
+            }
+        };
+
+        // --- 4. RECORDING & GALLERY FIX ---
+        recordBtn.onclick = () => {
+            chunks = [];
+            // Forcing 30fps stream for metadata consistency
+            const stream = canvas.captureStream(30); 
+            const audioTracks = video.srcObject.getAudioTracks();
+            if (audioTracks.length > 0) stream.addTrack(audioTracks[0]);
+
+            // Using VP8 as it's the most widely supported in mobile galleries
+            mediaRecorder = new MediaRecorder(stream, { 
+                mimeType: 'video/webm;codecs=vp8',
+                videoBitsPerSecond: 8000000 
+            });
+            
+            mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+            
+            mediaRecorder.onstop = async () => {
+                // The Fix: Create the blob and use a specific type
+                const blob = new Blob(chunks, { type: 'video/x-matroska;codecs=avc1,opus' });
+                // Fallback to webm if matroska fails
+                const finalBlob = blob.size > 0 ? blob : new Blob(chunks, { type: 'video/webm' });
+                
+                const url = URL.createObjectURL(finalBlob);
+                downloadLink.href = url;
+                downloadLink.download = `STABLE_${Date.now()}.mp4`; // Fake .mp4 extension helps Gallery indexing
+                downloadBtn.style.display = 'inline-flex';
+            };
+
+            mediaRecorder.start();
+            startTime = Date.now();
+            recordBtn.classList.add('recording');
+            recordBtn.style.display = 'none';
+            stopBtn.style.display = 'block';
+        };
+
+        stopBtn.onclick = () => {
+            mediaRecorder.stop();
+            recordBtn.classList.remove('recording');
+            stopBtn.style.display = 'none';
+            recordBtn.style.display = 'block';
+        };
+    </script>
+</body>
+</html>
