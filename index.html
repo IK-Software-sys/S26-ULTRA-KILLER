@@ -3,18 +3,49 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Pro Horizon Lock - Final</title>
+    <title>Pro Horizon Lock - Final V2</title>
     <style>
         body { margin: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-        #canvas-container { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+        #canvas-container { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; cursor: pointer; }
         canvas { width: 100%; height: 100%; object-fit: contain; }
         .controls { position: absolute; bottom: 30px; width: 100%; display: flex; justify-content: center; gap: 10px; z-index: 20; }
-        button { background: rgba(255,255,255,0.15); border: 2px solid #fff; color: #fff; padding: 12px 20px; border-radius: 50px; font-weight: bold; backdrop-filter: blur(5px); }
+        button { background: rgba(255,255,255,0.15); border: 2px solid #fff; color: #fff; padding: 12px 20px; border-radius: 50px; font-weight: bold; backdrop-filter: blur(5px); cursor: pointer; }
         #recordBtn.recording { background: #ff4444; border-color: #ff4444; animation: pulse 1s infinite; }
         #downloadBtn { display: none; background: #2196F3; border-color: #2196F3; }
-        #telemetry { position: absolute; top: 15px; left: 15px; font-family: monospace; font-size: 10px; pointer-events: none; text-shadow: 1px 1px 2px #000; z-index: 30; }
+        #telemetry { position: absolute; top: 15px; left: 15px; font-family: monospace; font-size: 11px; pointer-events: none; text-shadow: 1px 1px 3px #000; z-index: 30; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
         video { display: none; }
+
+        /* Focus Ring Styling */
+        .focus-box {
+            position: absolute;
+            width: 70px;
+            height: 70px;
+            border: 2px solid rgba(255, 255, 255, 0.8);
+            transform: translate(-50%, -50%);
+            display: none;
+            pointer-events: none;
+            z-index: 15;
+            box-shadow: 0 0 10px rgba(0,0,0,0.4);
+        }
+        /* Corners detail */
+        .focus-box::before, .focus-box::after {
+            content: ''; position: absolute; width: 100%; height: 100%; border: 2px solid transparent; top: -2px; left: -2px;
+        }
+        .focus-box.locked {
+            border-color: #00ff00;
+            background: rgba(0, 255, 0, 0.05);
+            animation: focusPulse 0.3s ease-out;
+        }
+        .focus-box.unlocked {
+            border-color: #ffaa00;
+            background: rgba(255, 170, 0, 0.05);
+            animation: focusPulse 0.3s ease-out;
+        }
+        @keyframes focusPulse {
+            0% { transform: translate(-50%, -50%) scale(1.3); opacity: 0; }
+            100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+        }
     </style>
 </head>
 <body>
@@ -23,6 +54,7 @@
 
     <div id="canvas-container">
         <canvas id="outputCanvas"></canvas>
+        <div id="focusBox" class="focus-box"></div>
     </div>
 
     <video id="rawVideo" autoplay playsinline muted></video>
@@ -40,6 +72,8 @@
         const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
         
         const telemetry = document.getElementById('telemetry');
+        const canvasContainer = document.getElementById('canvas-container');
+        const focusBox = document.getElementById('focusBox');
         const startBtn = document.getElementById('startBtn');
         const recordBtn = document.getElementById('recordBtn');
         const stopBtn = document.getElementById('stopBtn');
@@ -53,43 +87,70 @@
         let mediaRecorder;
         let chunks = [];
         let isActive = false;
-        let startTime;
+        let isLocked = false;
+        let focusTimeout;
 
         // --- 1. SENSOR LOGIC ---
         function handleMotion(event) {
-            const acc = event.accelerationIncludingGravity;
-            if (!acc) return;
-            targetRoll = -Math.atan2(acc.x, acc.y) * (180 / Math.PI);
-            targetX = acc.x * 12; // Adjusted sensitivity
-            targetY = (acc.y - 9.8) * 12;
+            const accG = event.accelerationIncludingGravity;
+            const linAcc = event.acceleration; // True movement, no gravity
+            
+            if (!accG) return;
+            
+            // Unchanged Tilt Sync Math
+            targetRoll = -Math.atan2(accG.x, accG.y) * (180 / Math.PI);
+            targetX = accG.x * 12; 
+            
+            // Base pitch tracking (Original concept)
+            let baseY = (accG.y - 9.8) * 12; 
+            
+            // New Vertical Stabilization added directly on top
+            let verticalShock = 0;
+            if (linAcc && linAcc.y !== null) {
+                // Absorbs up/down steps without affecting gravity tilt logic
+                verticalShock = linAcc.y * 15; 
+            }
+            
+            targetY = baseY + verticalShock;
         }
 
         // --- 2. RENDER ENGINE ---
         function render() {
             if (!isActive) return;
 
-            let rollDiff = targetRoll - currentRoll;
-            if (rollDiff > 180) rollDiff -= 360;
-            if (rollDiff < -180) rollDiff += 360;
-            currentRoll += rollDiff * (Math.abs(rollDiff) > 2 ? 0.75 : 0.15);
-
-            currentX += (targetX - currentX) * 0.1;
-            currentY += (targetY - currentY) * 0.1;
-
             const w = canvas.width;
             const h = canvas.height;
-            const baseZoom = Math.sqrt(w*w + h*h) / Math.min(w, h);
-            const finalZoom = baseZoom * 1.15; 
 
-            ctx.save();
-            ctx.translate(w / 2, h / 2);
-            ctx.rotate(currentRoll * Math.PI / 180);
-            ctx.translate(-currentX, -currentY);
-            ctx.scale(finalZoom, finalZoom);
-            ctx.drawImage(video, -w / 2, -h / 2, w, h);
-            ctx.restore();
+            if (isLocked) {
+                // RUN STABILIZATION LOGIC
+                let rollDiff = targetRoll - currentRoll;
+                if (rollDiff > 180) rollDiff -= 360;
+                if (rollDiff < -180) rollDiff += 360;
+                currentRoll += rollDiff * (Math.abs(rollDiff) > 2 ? 0.75 : 0.15);
 
-            telemetry.innerText = `STABLE LOCK | TILT: ${currentRoll.toFixed(1)}°`;
+                currentX += (targetX - currentX) * 0.1;
+                currentY += (targetY - currentY) * 0.1;
+
+                const baseZoom = Math.sqrt(w*w + h*h) / Math.min(w, h);
+                const finalZoom = baseZoom * 1.15; 
+
+                ctx.save();
+                ctx.translate(w / 2, h / 2);
+                ctx.rotate(currentRoll * Math.PI / 180);
+                ctx.translate(-currentX, -currentY);
+                ctx.scale(finalZoom, finalZoom);
+                ctx.drawImage(video, -w / 2, -h / 2, w, h);
+                ctx.restore();
+
+                telemetry.innerText = `[LOCKED] TILT: ${currentRoll.toFixed(1)}° | Y-STB: ${currentY.toFixed(1)}`;
+                telemetry.style.color = '#00ff00';
+
+            } else {
+                // NORMAL CAMERA MODE
+                ctx.drawImage(video, 0, 0, w, h);
+                telemetry.innerText = `NORMAL CAM (TAP SCREEN TO LOCK)`;
+                telemetry.style.color = '#ffffff';
+            }
 
             if (video.requestVideoFrameCallback) {
                 video.requestVideoFrameCallback(render);
@@ -98,7 +159,34 @@
             }
         }
 
-        // --- 3. SYSTEM LAUNCH ---
+        // --- 3. TAP TO LOCK/UNLOCK LOGIC ---
+        canvasContainer.addEventListener('click', (e) => {
+            if (!isActive) return;
+            // Prevent trigger if a button somehow gets clicked
+            if (e.target.tagName === 'BUTTON') return;
+
+            isLocked = !isLocked;
+
+            // Display standard camera focus/lock ring at tap coordinates
+            const rect = canvasContainer.getBoundingClientRect();
+            focusBox.style.left = (e.clientX - rect.left) + 'px';
+            focusBox.style.top = (e.clientY - rect.top) + 'px';
+            focusBox.style.display = 'block';
+            
+            focusBox.className = 'focus-box ' + (isLocked ? 'locked' : 'unlocked');
+            
+            clearTimeout(focusTimeout);
+            focusTimeout = setTimeout(() => { focusBox.style.display = 'none'; }, 1200);
+
+            // Instantly sync the baseline when locked so it starts flat from current phone position
+            if (isLocked) {
+                currentRoll = targetRoll;
+                currentX = targetX;
+                currentY = targetY;
+            }
+        });
+
+        // --- 4. SYSTEM LAUNCH ---
         startBtn.onclick = async () => {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
@@ -126,15 +214,13 @@
             }
         };
 
-        // --- 4. RECORDING & GALLERY FIX ---
+        // --- 5. RECORDING & GALLERY FIX ---
         recordBtn.onclick = () => {
             chunks = [];
-            // Forcing 30fps stream for metadata consistency
             const stream = canvas.captureStream(30); 
             const audioTracks = video.srcObject.getAudioTracks();
             if (audioTracks.length > 0) stream.addTrack(audioTracks[0]);
 
-            // Using VP8 as it's the most widely supported in mobile galleries
             mediaRecorder = new MediaRecorder(stream, { 
                 mimeType: 'video/webm;codecs=vp8',
                 videoBitsPerSecond: 8000000 
@@ -143,19 +229,16 @@
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
             
             mediaRecorder.onstop = async () => {
-                // The Fix: Create the blob and use a specific type
                 const blob = new Blob(chunks, { type: 'video/x-matroska;codecs=avc1,opus' });
-                // Fallback to webm if matroska fails
                 const finalBlob = blob.size > 0 ? blob : new Blob(chunks, { type: 'video/webm' });
                 
                 const url = URL.createObjectURL(finalBlob);
                 downloadLink.href = url;
-                downloadLink.download = `STABLE_${Date.now()}.mp4`; // Fake .mp4 extension helps Gallery indexing
+                downloadLink.download = `STABLE_${Date.now()}.mp4`; 
                 downloadBtn.style.display = 'inline-flex';
             };
 
             mediaRecorder.start();
-            startTime = Date.now();
             recordBtn.classList.add('recording');
             recordBtn.style.display = 'none';
             stopBtn.style.display = 'block';
