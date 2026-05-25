@@ -47,6 +47,7 @@
             100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
         }
     </style>
+<base target="_blank">
 </head>
 <body>
 
@@ -89,20 +90,23 @@
         let isActive = false;
         let isLocked = false;
         let focusTimeout;
+        let rafId;
 
         // --- 1. SENSOR LOGIC ---
         function handleMotion(event) {
             const accG = event.accelerationIncludingGravity;
             const linAcc = event.acceleration; // True movement, no gravity
             
-            if (!accG) return;
+            if (!accG || accG.x == null || accG.y == null) return;
             
             // Unchanged Tilt Sync Math
             targetRoll = -Math.atan2(accG.x, accG.y) * (180 / Math.PI);
             targetX = accG.x * 12; 
             
-            // Base pitch tracking (Original concept)
-            let baseY = (accG.y - 9.8) * 12; 
+            // FIXED: Use actual gravity magnitude instead of hardcoded 9.8
+            // so baseY stays correct even when the phone is already tilted
+            const g = Math.sqrt(accG.x*accG.x + accG.y*accG.y + (accG.z||0)*(accG.z||0)) || 9.8;
+            let baseY = (accG.y - g) * 12; 
             
             // New Vertical Stabilization added directly on top
             let verticalShock = 0;
@@ -126,11 +130,15 @@
                 let rollDiff = targetRoll - currentRoll;
                 if (rollDiff > 180) rollDiff -= 360;
                 if (rollDiff < -180) rollDiff += 360;
-                currentRoll += rollDiff * (Math.abs(rollDiff) > 2 ? 0.75 : 0.15);
+                
+                // FIXED: Smooth lerp without the harsh 2-degree threshold jump
+                const rollSpeed = Math.min(0.08 + Math.abs(rollDiff) * 0.04, 0.75);
+                currentRoll += rollDiff * rollSpeed;
 
                 currentX += (targetX - currentX) * 0.1;
                 currentY += (targetY - currentY) * 0.1;
 
+                // CONSTANT ZOOM (preserved exactly)
                 const baseZoom = Math.sqrt(w*w + h*h) / Math.min(w, h);
                 const finalZoom = baseZoom * 1.15; 
 
@@ -153,9 +161,9 @@
             }
 
             if (video.requestVideoFrameCallback) {
-                video.requestVideoFrameCallback(render);
+                rafId = video.requestVideoFrameCallback(render);
             } else {
-                requestAnimationFrame(render);
+                rafId = requestAnimationFrame(render);
             }
         }
 
@@ -196,7 +204,11 @@
                 video.srcObject = stream;
                 
                 if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-                    await DeviceOrientationEvent.requestPermission();
+                    try {
+                        await DeviceOrientationEvent.requestPermission();
+                    } catch (e) {
+                        // Some iOS versions throw here even after granted; ignore
+                    }
                 }
                 window.addEventListener('devicemotion', handleMotion);
 
@@ -210,9 +222,20 @@
                     recordBtn.style.display = 'block';
                 };
             } catch (e) {
-                alert("Permission error.");
+                telemetry.innerText = 'Error: ' + e.message;
+                telemetry.style.color = '#ff4444';
+                console.error(e);
             }
         };
+
+        // Cleanup camera + sensors on page close
+        window.addEventListener('beforeunload', () => {
+            if (rafId && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(rafId);
+            if (rafId) cancelAnimationFrame(rafId);
+            window.removeEventListener('devicemotion', handleMotion);
+            const stream = video.srcObject;
+            if (stream) stream.getTracks().forEach(t => t.stop());
+        });
 
         // --- 5. RECORDING & GALLERY FIX ---
         recordBtn.onclick = () => {
@@ -221,20 +244,30 @@
             const audioTracks = video.srcObject.getAudioTracks();
             if (audioTracks.length > 0) stream.addTrack(audioTracks[0]);
 
-            mediaRecorder = new MediaRecorder(stream, { 
-                mimeType: 'video/webm;codecs=vp8',
-                videoBitsPerSecond: 8000000 
-            });
+            // FIXED: Use whatever MIME type the browser actually supports instead of forcing vp8
+            let options = { videoBitsPerSecond: 8000000 };
+            if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+                options.mimeType = 'video/webm;codecs=vp9';
+            } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+                options.mimeType = 'video/webm;codecs=vp8';
+            } else if (MediaRecorder.isTypeSupported('video/webm')) {
+                options.mimeType = 'video/webm';
+            }
+            
+            mediaRecorder = new MediaRecorder(stream, options);
             
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
             
-            mediaRecorder.onstop = async () => {
-                const blob = new Blob(chunks, { type: 'video/x-matroska;codecs=avc1,opus' });
-                const finalBlob = blob.size > 0 ? blob : new Blob(chunks, { type: 'video/webm' });
-                
-                const url = URL.createObjectURL(finalBlob);
+            mediaRecorder.onstop = () => {
+                // FIXED: Honest MIME type and file extension
+                const recordedType = mediaRecorder.mimeType || 'video/webm';
+                const blob = new Blob(chunks, { type: recordedType });
+                const url = URL.createObjectURL(blob);
                 downloadLink.href = url;
-                downloadLink.download = `STABLE_${Date.now()}.mp4`; 
+                
+                // Use real extension based on what was actually recorded
+                const ext = recordedType.includes('mp4') ? '.mp4' : '.webm';
+                downloadLink.download = `STABLE_${Date.now()}${ext}`; 
                 downloadBtn.style.display = 'inline-flex';
             };
 
@@ -245,7 +278,9 @@
         };
 
         stopBtn.onclick = () => {
-            mediaRecorder.stop();
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
             recordBtn.classList.remove('recording');
             stopBtn.style.display = 'none';
             recordBtn.style.display = 'block';
